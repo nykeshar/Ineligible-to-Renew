@@ -1,0 +1,175 @@
+# Retailers Ineligible to Renew
+# Purpose: To produce list retailers ineligible to renew for EHS
+# Last Updated on 12/06/21
+
+## set dynamic values  
+name = "Nykesha.Johnson"
+permit_yr = "2022"
+application_yr = "2021"
+
+#change the month as needed
+month_apply = "9"
+
+#month_apply_othr = "7" #use only for August applicants; Glitch in PTRD allowed for
+#July applicants by accident
+
+## set working directory
+setwd(paste0("C:/Users/",name,
+             "/City of Philadelphia/Get Healthy Philly (CDIP) - Documents/GHP Data/Projects/Tobacco/PTRD Regular Reports/Lists/Permit nonrenewal list"))
+
+## load relevant libraries
+library(odbc)
+library(rstudioapi)
+library(DBI)
+library(dbplyr)
+library(lubridate)
+library(fs)
+library(Hmisc)
+library(kableExtra)
+library(tidyverse)
+library(stringr)
+library(readr)
+library(xlsx)
+
+## add references to source codes
+source(fs::path("C:/Users",name,"City of Philadelphia/Get Healthy Philly (CDIP) - Documents/GHP Data/Data/PTRD/Source code/PTRD_API_Connection.R"))
+
+#####
+# read in most recent OAR file
+oar_ticket_tbl <- read_csv(paste0("C:/Users/",name,"/City of Philadelphia/Get Healthy Philly (CDIP) - Documents/GHP Data/Data/PTRD/Ticket data - OAR/2021/Tobacco Violations Hearings_09_2021.csv")) %>%
+  #remove total fees row
+  filter(!is.na(`Ticket Number`)) %>%
+  mutate(`Ticket Number` = as.character(`Ticket Number`),
+         #remove $ and convert to numeric
+         `Reduction Amount` = as.numeric(str_remove(`Reduction Amount`,"\\$")))
+
+#####
+#Prep tables for analysis
+violations <- youth_sale_compchks_all %>% 
+    select(EstabID, CompChkDateTime,CompChkID,ViolationStatus) %>% 
+    mutate(CompChkDateTime = as_date(CompChkDateTime), 
+           EstabID = as.character(EstabID)) %>% 
+    #filter to checks that resulted in a violation 
+    filter(ViolationStatus == "Violation") %>%
+    distinct(CompChkID,.keep_all = TRUE)
+
+tickets <- tickets_all %>%
+    mutate(EstabID = as.character(EstabID))
+
+estabs  <- estabs_all %>%
+  mutate(EstabID = as.character(EstabID),
+         MailingAddressLine1 = paste(MailingStNum,MailingStDir,MailingStName, 
+                                     MailingStDesig, sep = " ")) %>%
+  select(PTRPApplicDate,PTRPNum,EstabID,LegalName,TradeName,CurrOwner,AppEmail,
+         MailingAddressLine1,MailingAddressLine2,MailingCity,MailingState,MailingZip)
+#####
+#0: Define look back period 
+#look back period refers to the 24 month period beginning the month before the applicant applies
+#For example if a retailer applies in Aug 2021 for a FY22 permit, the lookback period is July 1, 2019-July 31, 2021
+look_back_date_upper_limit <- as.Date(paste0(application_yr,"-",month_apply,"-01")) - 1
+look_back_date_lower_limit <- as.Date(paste0(year(look_back_date_upper_limit) - 2, "-", month(look_back_date_upper_limit), "-01"))
+
+#1: List of ticketed compliance checks that occurred in the 24 months prior to the look back date
+ticketed_chks <- estabs_all %>%
+    filter(PermitYear == permit_yr,
+           month(PTRPApplicDate) == month_apply) %>% 
+    mutate(EstabID = as.character(EstabID)) %>%
+    select(EstabID) %>%
+    #join with violations to get all checks that resulted in violations  
+    left_join(violations, by = "EstabID") %>%
+    #join with tickets to determine which checks resulted in tickets 
+    left_join(tickets, by = "CompChkID") %>%
+    #filter out missing tickets and 
+    filter(!is.na(TicketNum) & 
+            #filter for checks that occurred during the look back period
+            between(CompChkDateTime,look_back_date_lower_limit,look_back_date_upper_limit)) %>%
+            #filter to youth sales violations pending response from Ben 
+            # ViolationCode == "122") %>%
+    # Use distinct to get unique CompChkIDs 
+    #distinct(CompChkID, .keep_all = TRUE) %>%
+    select(EstabID.x,CompChkID,CompChkDateTime,ViolationStatus,TicketNum,ViolationCode,Violation,IssueDate) %>%
+    rename(EstabID = EstabID.x)
+
+#2: List of retailers that have 3 or more failed compliance checks that resulted in tickets in the
+# 24 months prior to the look back date
+risky_applicants <- ticketed_chks %>%
+      group_by(EstabID) %>%
+      # Use Summarize() to count the number of CompChkIDs that resulted in tickets
+      summarise(N_FailedChks = n_distinct(CompChkID)) %>%
+      #filter to retailers that 3 or more violations 
+      filter(N_FailedChks >= 3) 
+      
+#3: List of retailers that were not granted appeals for tickets issued
+liable_violators <- risky_applicants %>%
+      left_join(ticketed_chks, by = "EstabID") %>%
+      left_join(oar_ticket_tbl, by = c("TicketNum" = "Ticket Number")) %>%
+      select(EstabID, CompChkDateTime, CompChkID, TicketNum, IssueDate,ViolationCode,Violation,
+             `Reduction Amount`,`Hearing Date`,`Disposition Code and Description`) #%>%
+      #filter to tickets not granted an appeal
+      #if the Reduction Amount is >= $250 the ticket is not enforceable 
+      filter(`Reduction Amount` < 250 | is.na(`Reduction Amount`)) %>%
+      distinct(CompChkID, .keep_all = T)
+
+#3.5: Tally of liable violations      
+N_liable_violators <- liable_violators %>%
+      group_by(EstabID) %>%
+      summarise(N_Liable_Violations = n_distinct(CompChkID))
+
+#4: Final list of retailers applying in look back month that are ineligible to renew
+ineligible_to_renew <- N_liable_violators %>%
+      #filter to retailers that have 3 or more enforceable tickets
+      filter(N_Liable_Violations >= 3) %>%
+      mutate(EstabID = as.numeric(EstabID)) %>%
+      left_join(estabs_all, by = "EstabID") %>%
+      group_by(EstabID) %>%
+      arrange(desc(PermitYear)) %>%
+      distinct(EstabID, .keep_all = TRUE) %>%
+      select(EstabID, PTRPApplicDate, N_Liable_Violations, PermitYear, TradeName, LegalName,EstabAddress) %>%
+      mutate(PTRPApplicDate = as.Date(PTRPApplicDate)) %>%
+      rename(`Number of Violations` = N_Liable_Violations) 
+
+#5: Set up ineligible to renew for permit denial mailing 
+#Fields needed: application date, date of compliance checks, violation code, ticket number,
+#address & email?
+denial_mailing <- liable_violators %>% 
+  group_by(EstabID) %>%
+  mutate(`Ticket Number` = str_c("Ticket",seq_along(EstabID))) %>%
+  pivot_wider(id_col = EstabID, 
+              names_from = `Ticket Number`,
+              names_glue = "{`Ticket Number`}_{.value}",
+              values_from = c(CompChkDateTime,TicketNum,Violation,ViolationCode)) %>%
+  left_join(estabs, "EstabID") %>%
+  mutate(PTRPApplicDate = as.Date(PTRPApplicDate)) %>%
+  #Use arrange() to get the most recent application date 
+  arrange(desc(PTRPApplicDate)) %>%
+  distinct(EstabID, .keep_all = T)# %>%
+  #select(PTRPApplicDate,EstabID,
+          # Ticket1_CompChkDateTime,Ticket1_TicketNum,Ticket1_Violation,Ticket1_ViolationCode,
+          # Ticket2_CompChkDateTime,Ticket2_TicketNum,Ticket2_Violation,Ticket2_ViolationCode,
+          # Ticket3_CompChkDateTime,Ticket3_TicketNum,Ticket3_Violation,Ticket3_ViolationCode,
+          # Ticket4_CompChkDateTime,Ticket4_TicketNum,Ticket4_Violation,Ticket4_ViolationCode,
+          # Ticket5_CompChkDateTime,Ticket5_TicketNum,Ticket5_Violation,Ticket5_ViolationCode) 
+
+#5: Create initial Excel WorkBook that will have a sheet for each month ineligible applicants  
+# write.xlsx(x = as.data.frame(ineligible_to_renew),
+#            file = "FY22 Retailers Ineligible to Renew.xlsx",
+#            sheetName = "AUG_2021",
+#            col.names = T,
+#            row.names = F)
+
+#6: Add new sheet each month
+write.xlsx(as.data.frame(ineligible_to_renew),
+           file = "FY22/FY22 Retailers Ineligible to Renew.xlsx",
+           sheetName = str_to_upper(paste0(month(look_back_date_upper_limit + days(1),label = TRUE),"_2021")),
+           col.names = T,
+           row.names = F,
+           append = T)
+#7: 
+write.xlsx(as.data.frame(ineligible_to_renew),
+           file = "FY22/Retailers_Ineligible_to_Renew_Oct_2021.xlsx",
+           col.names = T,
+           row.names = F,
+           append = T)
+
+look <- estabs_all %>%
+    filter(EstabID == "11193")
